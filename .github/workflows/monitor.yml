@@ -1,0 +1,30 @@
+name: Keyword Monitor Bot
+
+on:
+  schedule:
+    # 1시간마다 실행 (크론 문법: '분 시 일 월 요일')
+    # 원하실 경우, '0 * * * *' 대신 '0 9,12,17 * * *' (평일 9시, 12시, 5시) 등으로 변경 가능합니다.
+    - cron: '0 * * * *' 
+  workflow_dispatch:
+    # GitHub Actions 탭에서 'Run workflow' 버튼을 눌러 수동 실행 가능하도록 설정
+
+jobs:
+  run_scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      # Node.js 의존성 설치 (package.json 기반)
+      - name: Install Dependencies
+        run: npm install
+
+      # 스크립트 실행
+      - name: Run Telegram/Email Scraper
+        run: node telegram_bot.js
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
