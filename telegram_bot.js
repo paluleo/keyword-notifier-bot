@@ -1,0 +1,1 @@
+{"name": "keyword-notifier-bot","version": "1.0.0","description": "GitHub Action script for keyword monitoring and Telegram/Email notification.","main": "telegram_bot.js","dependencies": {"firebase-admin": "^11.5.0","axios": "^1.2.2"},"scripts": {"start": "node telegram_bot.js"}}

@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>키워드 알림 관리자</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fb; }
+        .card { box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05); }
+        .btn-primary { background-color: #0052cc; transition: background-color 0.2s; }
+        .btn-primary:hover { background-color: #0045a5; }
+        .btn-danger { background-color: #ff5630; transition: background-color 0.2s; }
+        .btn-danger:hover { background-color: #e04a29; }
+        /* 모달 배경 */
+        .modal-overlay { background-color: rgba(9, 30, 66, 0.54); }
+        .badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+    </style>
+</head>
+<body class="p-4 md:p-8 min-h-screen">
+
+    <!-- Firebase SDK 로드 -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, updateDoc, deleteDoc, onSnapshot, collection, query, FieldValue, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+
+        // Firebase 로깅 활성화 (디버깅용)
+        setLogLevel('debug');
+
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+        let isEditMode = false;
+        let currentEditDocId = null;
+
+        // 즉시 실행 함수로 Firebase 초기화 로직을 감싸서 SyntaxError: Illegal return statement 해결
+        (function initFirebase() {
+            // 전역 변수 설정 (캔버스 환경에서 제공됨)
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+            
+            // Firebase Config 로드 및 초기화
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+            if (!firebaseConfig.apiKey) {
+                document.getElementById('app-container').innerHTML = `
+                    <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
+                        <strong class="font-bold">Firebase 설정 오류가 발생했습니다.</strong>
+                        <span class="block sm:inline">로컬에서 실행하려면 firebaseConfig를 수동으로 입력해야 합니다.</span>
+                    </div>
+                `;
+                // 설정이 없으면 여기서 실행 중단
+                return;
+            }
+
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            
+            // --- 인증 및 데이터 리스너 설정 ---
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    userId = user.uid;
+                    document.getElementById('user-info').textContent = `User ID: ${userId}`;
+                    setupDataListener(userId);
+                } else {
+                    console.log("No user signed in. Attempting sign-in...");
+                    handleAuth(initialAuthToken);
+                }
+            });
+        })(); // IIFE 종료
+
+        // --- 헬퍼 함수 ---
+
+        // 문자열에 포함된 특수문자를 HTML 속성 내에서 안전하게 사용할 수 있도록 이스케이프 처리합니다.
+        const escapeAttr = (str) => {
+            if (!str) return '';
+            return String(str).replace(/"/g, '&quot;')
+                      .replace(/'/g, '&#39;')
+                      .replace(/</g, '&lt;')
+                      .replace(/>/g, '&gt;')
+                      .replace(/\n/g, '&#10;')
+                      .replace(/\r/g, '&#13;');
+        };
+        
+        // --- UI 요소 참조 ---
+        const listContainer = document.getElementById('list-container');
+        const modal = document.getElementById('modal');
+        const saveButton = document.getElementById('save-button');
+        const addLinkButton = document.getElementById('add-link-button');
+        const modalTitle = document.getElementById('modal-title');
+        const form = document.getElementById('config-form');
+        
+        const urlInput = document.getElementById('url');
+        const keywordInput = document.getElementById('keyword');
+        const telegramIdInput = document.getElementById('telegram-id');
+        const emailInput = document.getElementById('email');
+        
+        // --- 로딩 및 버튼 상태 관리 ---
+        const setSaveButtonLoading = (loading, isEdit) => {
+            saveButton.disabled = loading;
+            if (loading) {
+                saveButton.textContent = '처리 중...';
+            } else {
+                saveButton.textContent = isEdit ? '수정 완료' : '저장하기';
+            }
+        };
+
+        const showModal = (editData = null) => {
+            modal.classList.remove('hidden');
+            document.getElementById('modal-overlay').classList.remove('hidden');
+            document.body.classList.add('overflow-hidden');
+            
+            if (editData) {
+                isEditMode = true;
+                currentEditDocId = editData.id;
+                modalTitle.textContent = '알림 설정 수정';
+                urlInput.value = editData.url || '';
+                keywordInput.value = editData.keyword || '';
+                telegramIdInput.value = editData.telegramId || '';
+                emailInput.value = editData.email || '';
+                setSaveButtonLoading(false, true); // 수정 모드 텍스트 설정
+            } else {
+                isEditMode = false;
+                currentEditDocId = null;
+                modalTitle.textContent = '새 알림 설정 추가';
+                form.reset();
+                setSaveButtonLoading(false, false); // 저장 모드 텍스트 설정
+            }
+        };
+
+        const hideModal = () => {
+            modal.classList.add('hidden');
+            document.getElementById('modal-overlay').classList.add('hidden');
+            document.body.classList.remove('overflow-hidden');
+            isEditMode = false;
+            currentEditDocId = null;
+            form.reset();
+        };
+
+        // --- 데이터 처리 함수 ---
+
+        const getCollectionPath = (uid) => `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${uid}/scraper_configs`;
+
+        const saveConfig = async (e) => {
+            e.preventDefault();
+
+            if (!userId) {
+                console.error("User ID is not available.");
+                return;
+            }
+
+            const data = {
+                url: urlInput.value.trim(),
+                keyword: keywordInput.value.trim(),
+                telegramId: telegramIdInput.value.trim(),
+                email: emailInput.value.trim(),
+                createdAt: serverTimestamp() // Firestore에서 import된 serverTimestamp 사용
+            };
+
+            if (!data.url || !data.keyword) {
+                alert('URL과 키워드는 필수 입력 항목입니다.');
+                return;
+            }
+
+            setSaveButtonLoading(true, isEditMode);
+
+            try {
+                const configCollection = collection(db, getCollectionPath(userId));
+                
+                if (isEditMode && currentEditDocId) {
+                    // 수정 모드
+                    const docRef = doc(configCollection, currentEditDocId);
+                    // createdAt은 수정 시 업데이트하지 않음
+                    const { createdAt, ...updateData } = data;
+                    await updateDoc(docRef, updateData);
+                    console.log("문서 수정 완료:", currentEditDocId);
+                } else {
+                    // 추가 모드
+                    await addDoc(configCollection, data);
+                    console.log("새 문서 추가 완료");
+                }
+                
+                hideModal();
+            } catch (error) {
+                console.error("설정 저장/수정 중 오류 발생:", error);
+                alert("설정 저장/수정 중 오류가 발생했습니다. 콘솔을 확인하세요.");
+            } finally {
+                setSaveButtonLoading(false, isEditMode);
+            }
+        };
+        
+        const deleteConfig = async (docId, url) => {
+            if (!userId) return;
+
+            // 사용자 친화적인 confirm 대신, custom modal을 사용해야 함 (요청에 따라 기본 confirm 사용)
+            if (confirm(`정말로 URL: ${url} 알림 설정을 삭제하시겠습니까?`)) {
+                try {
+                    const docRef = doc(db, getCollectionPath(userId), docId);
+                    await deleteDoc(docRef);
+                    console.log("문서 삭제 완료:", docId);
+                } catch (error) {
+                    console.error("설정 삭제 중 오류 발생:", error);
+                    alert("설정 삭제 중 오류가 발생했습니다.");
+                }
+            }
+        };
+
+
+        // --- UI 렌더링 함수 ---
+        
+        const renderList = (configs) => {
+            if (!listContainer) return;
+
+            if (configs.length === 0) {
+                listContainer.innerHTML = `
+                    <div class="p-6 text-center text-gray-500 bg-white rounded-lg card">
+                        저장된 알림 설정이 없습니다. 상단의 '새 알림 설정 추가' 버튼을 눌러 시작하세요.
+                    </div>
+                `;
+                return;
+            }
+
+            listContainer.innerHTML = configs.map(config => {
+                // 데이터를 JSON 문자열로 안전하게 인코딩
+                const dataJson = escapeAttr(JSON.stringify({
+                    id: config.id,
+                    url: config.url,
+                    keyword: config.keyword,
+                    telegramId: config.telegramId,
+                    email: config.email
+                }));
+
+                return `
+                    <div class="bg-white p-4 rounded-lg card flex flex-col md:flex-row justify-between items-start md:items-center space-y-3 md:space-y-0 border-l-4 border-blue-500">
+                        <div class="flex-grow">
+                            <div class="text-sm font-semibold text-gray-800 break-all">${config.url}</div>
+                            <div class="mt-1 flex flex-wrap items-center space-x-2">
+                                <span class="badge bg-yellow-100 text-yellow-800">키워드: ${config.keyword || '없음'}</span>
+                                ${config.telegramId ? `<span class="badge bg-blue-100 text-blue-800">Telegram ID: ${config.telegramId}</span>` : ''}
+                                ${config.email ? `<span class="badge bg-green-100 text-green-800">이메일: ${config.email}</span>` : ''}
+                            </div>
+                        </div>
+                        <div class="flex space-x-2">
+                            <button data-config='${dataJson}' 
+                                class="edit-btn px-3 py-1 text-sm font-medium text-white bg-green-500 rounded-md hover:bg-green-600 transition">
+                                수정
+                            </button>
+                            <button onclick="window.handleDeleteClick('${config.id}', '${escapeAttr(config.url)}')"
+                                class="delete-btn px-3 py-1 text-sm font-medium text-white btn-danger rounded-md">
+                                삭제
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        };
+        
+        // --- 전역 이벤트 핸들러 및 리스너 등록 ---
+        
+        // HTML onclick에서 사용하기 위해 전역 함수 등록
+        window.handleDeleteClick = (docId, url) => deleteConfig(docId, url);
+        
+        // 이벤트 위임을 사용하여 '수정' 버튼 클릭 처리
+        listContainer.addEventListener('click', (e) => {
+            if (e.target.classList.contains('edit-btn')) {
+                const dataJson = e.target.dataset.config;
+                try {
+                    const editData = JSON.parse(dataJson);
+                    showModal(editData);
+                } catch (error) {
+                    console.error("수정 데이터 파싱 오류:", error);
+                }
+            }
+        });
+
+        // --- Firebase 인증 및 데이터 리스너 설정 ---
+
+        const setupDataListener = (uid) => {
+            const q = query(collection(db, getCollectionPath(uid)));
+
+            onSnapshot(q, (snapshot) => {
+                const configs = [];
+                snapshot.forEach(doc => {
+                    configs.push({ id: doc.id, ...doc.data() });
+                });
+                
+                // 최신 항목이 위로 오도록 내림차순 정렬 (createdAt이 없거나 null이면 맨 아래로)
+                configs.sort((a, b) => {
+                    const timeA = a.createdAt ? a.createdAt.toMillis() : 0;
+                    const timeB = b.createdAt ? b.createdAt.toMillis() : 0;
+                    return timeB - timeA;
+                });
+                
+                renderList(configs);
+            });
+        };
+
+        const handleAuth = async (initialAuthToken) => {
+            // 캔버스 환경 토큰이 있으면 커스텀 로그인 시도
+            if (initialAuthToken) {
+                try {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } catch (error) {
+                    console.error("Custom token sign-in failed. Falling back to anonymous.", error);
+                    await signInAnonymously(auth);
+                }
+            } else {
+                // 토큰이 없으면 익명 로그인 시도
+                await signInAnonymously(auth);
+            }
+        };
+
+        // --- 이벤트 리스너 등록 ---
+        addLinkButton.addEventListener('click', () => showModal());
+        document.getElementById('close-modal').addEventListener('click', hideModal);
+        document.getElementById('config-form').addEventListener('submit', saveConfig);
+        document.getElementById('modal-overlay').addEventListener('click', (e) => {
+            // 모달 오버레이를 클릭하면 닫기
+            if (e.target.id === 'modal-overlay') hideModal();
+        });
+
+    </script>
+
+    <div id="app-container" class="max-w-4xl mx-auto">
+        
+        <!-- 헤더 및 사용자 정보 -->
+        <header class="mb-6 pb-4 border-b border-gray-200">
+            <h1 class="text-3xl font-bold text-gray-900">🔔 키워드 알림 관리자</h1>
+            <p class="text-gray-500 mt-1">게시판 키워드 감지 및 텔레그램/이메일 알림 설정</p>
+            <div id="user-info" class="text-xs text-gray-400 mt-2">인증 중...</div>
+        </header>
+
+        <!-- 메인 액션 버튼 -->
+        <div class="mb-6 flex justify-between items-center">
+            <h2 class="text-xl font-semibold text-gray-800">저장된 알림 목록</h2>
+            <button id="add-link-button" class="flex items-center px-4 py-2 text-white btn-primary rounded-lg text-sm font-medium">
+                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+                새 알림 설정 추가
+            </button>
+        </div>
+
+        <!-- 알림 목록 컨테이너 -->
+        <div id="list-container" class="space-y-4">
+            <!-- 알림 설정 항목들이 여기에 렌더링됩니다. -->
+        </div>
+
+    </div>
+
+    <!-- 모달 (설정 추가/수정 팝업) -->
+    <div id="modal-overlay" class="modal-overlay fixed inset-0 z-40 hidden">
+        <div id="modal" class="fixed inset-0 flex items-center justify-center p-4 z-50">
+            <div class="bg-white w-full max-w-lg p-6 rounded-xl card transform transition-all">
+                <div class="flex justify-between items-center pb-3 border-b border-gray-200">
+                    <h3 id="modal-title" class="text-2xl font-semibold text-gray-800">새 알림 설정 추가</h3>
+                    <button id="close-modal" class="text-gray-400 hover:text-gray-600">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                
+                <form id="config-form" class="mt-4 space-y-4">
+                    
+                    <!-- URL 입력 -->
+                    <div>
+                        <label for="url" class="block text-sm font-medium text-gray-700 mb-1">
+                            게시판 주소 (URL) <span class="text-red-500">*</span>
+                        </label>
+                        <input type="url" id="url" required 
+                               placeholder="예: https://게시판.com/board/list"
+                               class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                    </div>
+
+                    <!-- 키워드 입력 -->
+                    <div>
+                        <label for="keyword" class="block text-sm font-medium text-gray-700 mb-1">
+                            키워드 (쉼표로 구분) <span class="text-red-500">*</span>
+                        </label>
+                        <input type="text" id="keyword" required 
+                               placeholder="예: 특별공급, 맑은오피스업무, 중요공지"
+                               class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                    </div>
+
+                    <p class="pt-2 text-sm font-semibold text-gray-800 border-t pt-4">알림 수신 설정</p>
+
+                    <!-- Telegram ID 입력 -->
+                    <div>
+                        <label for="telegram-id" class="block text-sm font-medium text-gray-700 mb-1">
+                            Telegram Chat ID
+                        </label>
+                        <input type="text" id="telegram-id" 
+                               placeholder="텔레그램 봇이 알림을 보낼 Chat ID"
+                               class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                        <p class="text-xs text-gray-500 mt-1">봇과 대화 후, ID를 입력해야 알림을 받을 수 있습니다.</p>
+                    </div>
+
+                    <!-- Email 입력 -->
+                    <div>
+                        <label for="email" class="block text-sm font-medium text-gray-700 mb-1">
+                            이메일 주소
+                        </label>
+                        <input type="email" id="email" 
+                               placeholder="알림을 받을 이메일 주소"
+                               class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                    </div>
+                    
+                    <!-- 저장 버튼 -->
+                    <div class="pt-4 border-t border-gray-100">
+                        <button id="save-button" type="submit" class="w-full px-4 py-3 text-white btn-primary rounded-lg text-base font-semibold">
+                            저장하기
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
